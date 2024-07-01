@@ -18,6 +18,7 @@ import (
 	"github.com/urfave/cli"
 	kcp "github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/kcptun/generic"
+	"github.com/xtaci/qpp"
 	"github.com/xtaci/smux"
 )
 
@@ -28,6 +29,8 @@ const (
 	maxSmuxVer = 2
 	// stream copy buffer size
 	bufSize = 4096
+	// quantum bits
+	QUBIT = 8
 )
 
 // VERSION is injected by buildflags
@@ -66,6 +69,64 @@ func handleClient(session *smux.Session, p1 net.Conn, quiet bool) {
 
 	go streamCopy(p1, p2)
 	streamCopy(p2, p1)
+}
+
+// same as above, but handles quantum permutation pads
+func handleQPPClient(_Q_ *qpp.QuantumPermutationPad, seed []byte, session *smux.Session, p1 net.Conn, quiet bool) {
+	logln := func(v ...interface{}) {
+		if !quiet {
+			log.Println(v...)
+		}
+	}
+	defer p1.Close()
+	p2, err := session.OpenStream()
+	if err != nil {
+		logln(err)
+		return
+	}
+
+	defer p2.Close()
+
+	logln("stream opened", "in:", p1.RemoteAddr(), "out:", fmt.Sprint(p2.RemoteAddr(), "(", p2.ID(), ")"))
+	defer logln("stream closed", "in:", p1.RemoteAddr(), "out:", fmt.Sprint(p2.RemoteAddr(), "(", p2.ID(), ")"))
+
+	// copy from net.Conn, QPP-encrypt and send to session
+	go func() {
+		buf := make([]byte, bufSize)
+		prng := _Q_.CreatePRNG(seed)
+		for {
+			n, err := p1.Read(buf)
+			if err != nil {
+				p1.Close()
+				return
+			}
+
+			// QPP-encrypt
+			_Q_.EncryptWithPRNG(buf[:n], prng)
+			if _, err = p2.Write(buf[:n]); err != nil {
+				p2.Close()
+				return
+			}
+		}
+	}()
+
+	// copy from stream, QPP-decrypt and send to net.Conn
+	buf := make([]byte, bufSize)
+	prng := _Q_.CreatePRNG(seed)
+	for {
+		n, err := p2.Read(buf)
+		if err != nil {
+			p2.Close()
+			return
+		}
+
+		// QPP-encrypt
+		_Q_.DecryptWithPRNG(buf[:n], prng)
+		if _, err = p1.Write(buf[:n]); err != nil {
+			p1.Close()
+			return
+		}
+	}
 }
 
 func checkError(err error) {
@@ -117,6 +178,15 @@ func main() {
 			Name:  "mode",
 			Value: "fast",
 			Usage: "profiles: fast3, fast2, fast, normal, manual",
+		},
+		cli.BoolFlag{
+			Name:  "QPP",
+			Usage: "Enable Quantum Permutation Pad for universal quantum-safe cryptography, based on classic cryptography",
+		},
+		cli.IntFlag{
+			Name:  "QPPCount",
+			Value: 64,
+			Usage: "Number of pads to use for QPP, the more the pads, the more secure, one pad costs 256 bytes",
 		},
 		cli.IntFlag{
 			Name:  "conn",
@@ -283,6 +353,8 @@ func main() {
 		config.Quiet = c.Bool("quiet")
 		config.TCP = c.Bool("tcp")
 		config.Pprof = c.Bool("pprof")
+		config.QPP = c.Bool("QPP")
+		config.QPPCount = c.Int("QPPCount")
 
 		if c.String("c") != "" {
 			err := parseJSONConfig(&config, c.String("c"))
@@ -329,6 +401,8 @@ func main() {
 		log.Println("smux version:", config.SmuxVer)
 		log.Println("listening on:", listener.Addr())
 		log.Println("encryption:", config.Crypt)
+		log.Println("QPP:", config.QPP)
+		log.Println("QPP Count:", config.QPPCount)
 		log.Println("nodelay parameters:", config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
 		log.Println("remote address:", config.RemoteAddr)
 		log.Println("sndwnd:", config.SndWnd, "rcvwnd:", config.RcvWnd)
@@ -464,6 +538,13 @@ func main() {
 		numconn := uint16(config.Conn)
 		muxes := make([]timedSession, numconn)
 		rr := uint16(0)
+
+		// create shared QPP
+		var _Q_ *qpp.QuantumPermutationPad
+		if config.QPP {
+			_Q_ = qpp.NewQPP(pass, uint16(config.QPPCount), QUBIT)
+		}
+
 		for {
 			p1, err := listener.Accept()
 			if err != nil {
@@ -481,7 +562,11 @@ func main() {
 				}
 			}
 
-			go handleClient(muxes[idx].session, p1, config.Quiet)
+			if !config.QPP {
+				go handleClient(muxes[idx].session, p1, config.Quiet)
+			} else {
+				go handleQPPClient(_Q_, pass, muxes[idx].session, p1, config.Quiet)
+			}
 			rr++
 		}
 	}
